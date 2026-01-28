@@ -1653,7 +1653,7 @@ void program_node::create_onednn_primitive_attributes(
                     post_ops.append_binary(alg, dnnl::memory::desc(dims, dt, fmt));
                     update_onednn_post_op_list(op_type, dep_idx, fmt, false, dims, dt);
                 } else {
-                    auto mem_desc = cldnn::format::is_blocked(get_output_layout().format)
+                    auto mem_desc = cldnn::format::is_blocked(get_output_layout().format) || this->is_type<reduce>()
                         ? onednn::layout_to_memory_desc_blocked(in, dnnl::memory::format_tag::undef)
                         : onednn::layout_to_memory_desc(in, dnnl::memory::format_tag::undef);
                     post_ops.append_binary(alg, mem_desc);
