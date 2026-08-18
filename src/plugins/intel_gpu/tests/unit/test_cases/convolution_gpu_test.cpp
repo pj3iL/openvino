@@ -11476,6 +11476,298 @@ TEST(convolution_gpu_onednn, alloc_intermediate_when_concat_optimized) {
     auto outputs = network.execute();
 }
 
+// -- oneDNN f32 convolution (TF32) --------------------------------------------------
+// Static f32/f32 convolutions run on the oneDNN impl through the f32->tf32 fpmath path,
+// checked against an exact f32 host reference within TF32 precision.
+
+// f32 in / f32 out.
+TEST(convolution_gpu_onednn, fp32_tf32_basic) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP() << "oneDNN/XMX (immad) required for the f32 tf32 path.";
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    const int batch_num = 1, in_f = 16, out_f = 16, in_xy = 8, k = 3;
+
+    auto input_data = rg.generate_random_4d<float>(batch_num, in_f, in_xy, in_xy, -1, 1);
+    auto weights_data = rg.generate_random_4d<float>(out_f, in_f, k, k, -1, 1);
+    auto input_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(batch_num, in_f, in_xy, in_xy) });
+    auto weights_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(out_f, in_f, k, k) });
+    set_values(input_mem, flatten_4d(format::bfyx, input_data));
+    set_values(weights_mem, flatten_4d(format::bfyx, weights_data));
+
+    auto ref = VVVVF<float>(batch_num, VVVF<float>(out_f));
+    for (int b = 0; b < batch_num; ++b)
+        for (int of = 0; of < out_f; ++of)
+            ref[b][of] = reference_convolve<float>(input_data[b], weights_data[of], 1, 1, 0);
+
+    topology topology(
+        input_layout("input", input_mem->get_layout()),
+        data("weights", weights_mem),
+        convolution("conv", input_info("input"), "weights", no_bias, 1, { 1, 1 }, { 1, 1 }, { 0, 0 }, { 0, 0 }, false),
+        reorder("out", input_info("conv"), format::bfyx, data_types::f32));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::custom_outputs(std::vector<std::string>{ "conv", "out" }));
+
+    network network(engine, topology, config);
+    network.set_input_data("input", input_mem);
+    auto outputs = network.execute();
+
+    auto* sel_impl = network.get_primitive("conv")->get_impl();
+    ASSERT_TRUE(sel_impl && sel_impl->is_onednn())
+        << "f32 conv was not selected onto oneDNN; running generic impl: " << network.get_implementation_info("conv");
+
+    auto out_ptr = get_output_values_to_float<float>(network, outputs.at("out"));
+    auto out_lay = outputs.at("out").get_memory()->get_layout();
+    const int out_xy = in_xy - k + 1;
+    ASSERT_EQ(out_lay.batch(), batch_num);
+    ASSERT_EQ(out_lay.feature(), out_f);
+    ASSERT_EQ(out_lay.spatial(1), out_xy);
+    ASSERT_EQ(out_lay.spatial(0), out_xy);
+
+    for (int of = 0; of < out_f; ++of)
+        for (int y = 0; y < out_xy; ++y)
+            for (int x = 0; x < out_xy; ++x) {
+                auto offset = out_lay.get_linear_offset(tensor(batch(0), feature(of), spatial(x, y, 0, 0)));
+                ASSERT_NEAR(ref[0][of][y][x], out_ptr[offset], 1e-2f * std::max(1.0f, std::abs(ref[0][of][y][x])))
+                    << " of=" << of << " y=" << y << " x=" << x;
+            }
+}
+
+// f32 with bias and a non-unit stride.
+TEST(convolution_gpu_onednn, fp32_tf32_bias_strided) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP() << "oneDNN/XMX (immad) required for the f32 tf32 path.";
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    const int batch_num = 1, in_f = 16, out_f = 16, in_xy = 8, k = 3, stride = 2;
+
+    auto input_data = rg.generate_random_4d<float>(batch_num, in_f, in_xy, in_xy, -1, 1);
+    auto weights_data = rg.generate_random_4d<float>(out_f, in_f, k, k, -1, 1);
+    auto bias_data = rg.generate_random_1d<float>(out_f, -1, 1);
+    auto input_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(batch_num, in_f, in_xy, in_xy) });
+    auto weights_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(out_f, in_f, k, k) });
+    auto bias_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, out_f, 1, 1) });
+    set_values(input_mem, flatten_4d(format::bfyx, input_data));
+    set_values(weights_mem, flatten_4d(format::bfyx, weights_data));
+    set_values(bias_mem, bias_data);
+
+    auto ref = VVVVF<float>(batch_num, VVVF<float>(out_f));
+    for (int b = 0; b < batch_num; ++b)
+        for (int of = 0; of < out_f; ++of)
+            ref[b][of] = reference_convolve<float>(input_data[b], weights_data[of], stride, stride, bias_data[of]);
+
+    topology topology(
+        input_layout("input", input_mem->get_layout()),
+        data("weights", weights_mem),
+        data("bias", bias_mem),
+        convolution("conv", input_info("input"), "weights", "bias", 1, { stride, stride }, { 1, 1 }, { 0, 0 }, { 0, 0 }, false),
+        reorder("out", input_info("conv"), format::bfyx, data_types::f32));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::custom_outputs(std::vector<std::string>{ "conv", "out" }));
+
+    network network(engine, topology, config);
+    network.set_input_data("input", input_mem);
+    auto outputs = network.execute();
+
+    auto* sel_impl = network.get_primitive("conv")->get_impl();
+    ASSERT_TRUE(sel_impl && sel_impl->is_onednn())
+        << "f32 conv was not selected onto oneDNN; running generic impl: " << network.get_implementation_info("conv");
+
+    auto out_ptr = get_output_values_to_float<float>(network, outputs.at("out"));
+    auto out_lay = outputs.at("out").get_memory()->get_layout();
+    const int out_xy = (in_xy - k) / stride + 1;
+    ASSERT_EQ(out_lay.feature(), out_f);
+    ASSERT_EQ(out_lay.spatial(0), out_xy);
+    for (int of = 0; of < out_f; ++of)
+        for (int y = 0; y < out_xy; ++y)
+            for (int x = 0; x < out_xy; ++x) {
+                auto offset = out_lay.get_linear_offset(tensor(batch(0), feature(of), spatial(x, y, 0, 0)));
+                ASSERT_NEAR(ref[0][of][y][x], out_ptr[offset], 1e-2f * std::max(1.0f, std::abs(ref[0][of][y][x])))
+                    << " of=" << of << " y=" << y << " x=" << x;
+            }
+}
+
+// A dynamic-shape f32 conv is not eligible for the oneDNN f32 path and runs on the generic
+// (OpenCL) kernel instead.
+TEST(convolution_gpu_onednn, fp32_dynamic_falls_back_to_generic) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP() << "oneDNN/XMX (immad) required to make the negative check meaningful.";
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    const int batch_num = 1, in_f = 16, out_f = 16, in_xy = 8, k = 3;
+
+    auto input_data = rg.generate_random_4d<float>(batch_num, in_f, in_xy, in_xy, -1, 1);
+    auto weights_data = rg.generate_random_4d<float>(out_f, in_f, k, k, -1, 1);
+    auto input_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(batch_num, in_f, in_xy, in_xy) });
+    auto weights_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(out_f, in_f, k, k) });
+    set_values(input_mem, flatten_4d(format::bfyx, input_data));
+    set_values(weights_mem, flatten_4d(format::bfyx, weights_data));
+
+    auto ref = VVVVF<float>(batch_num, VVVF<float>(out_f));
+    for (int of = 0; of < out_f; ++of)
+        ref[0][of] = reference_convolve<float>(input_data[0], weights_data[of], 1, 1, 0);
+
+    // Dynamic spatials keep the conv node non-static.
+    layout in_dyn{ ov::PartialShape{ batch_num, in_f, ov::Dimension(), ov::Dimension() }, data_types::f32, format::bfyx };
+
+    topology topology(
+        input_layout("input", in_dyn),
+        data("weights", weights_mem),
+        convolution("conv", input_info("input"), "weights", no_bias, 1, { 1, 1 }, { 1, 1 }, { 0, 0 }, { 0, 0 }, false),
+        reorder("out", input_info("conv"), format::bfyx, data_types::f32));
+
+    ExecutionConfig config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+
+    network network(engine, topology, config);
+    network.set_input_data("input", input_mem);
+    auto outputs = network.execute();
+
+    auto* impl = network.get_primitive("conv")->get_impl();
+    ASSERT_TRUE(impl == nullptr || !impl->is_onednn())
+        << "dynamic f32 conv was selected onto oneDNN; impl: " << network.get_implementation_info("conv");
+
+    auto out_ptr = get_output_values_to_float<float>(network, outputs.at("out"));
+    auto out_lay = outputs.at("out").get_memory()->get_layout();
+    const int out_xy = in_xy - k + 1;
+    ASSERT_EQ(out_lay.feature(), out_f);
+    ASSERT_EQ(out_lay.spatial(0), out_xy);
+    for (int of = 0; of < out_f; ++of)
+        for (int y = 0; y < out_xy; ++y)
+            for (int x = 0; x < out_xy; ++x) {
+                auto offset = out_lay.get_linear_offset(tensor(batch(0), feature(of), spatial(x, y, 0, 0)));
+                ASSERT_NEAR(ref[0][of][y][x], out_ptr[offset], 1e-2f * std::max(1.0f, std::abs(ref[0][of][y][x])))
+                    << " of=" << of << " y=" << y << " x=" << x;
+            }
+}
+
+// f32 conv with a non-f32 output dtype {f16,bf16,u8,i8}. The conv output dtype comes from a fused
+// post-op: an eltwise scale for f16/bf16, a quantize for u8/i8.
+struct conv_onednn_fp32_out_param { data_types out_dt; float tol; };
+
+class convolution_gpu_onednn_fp32_out : public ::testing::TestWithParam<conv_onednn_fp32_out_param> {};
+
+INSTANTIATE_TEST_SUITE_P(fp32_fused_output_dtype, convolution_gpu_onednn_fp32_out,
+    ::testing::Values(
+        conv_onednn_fp32_out_param{ data_types::f16,  0.05f },
+        conv_onednn_fp32_out_param{ data_types::bf16, 0.20f },
+        conv_onednn_fp32_out_param{ data_types::u8,   2.0f  },
+        conv_onednn_fp32_out_param{ data_types::i8,   2.0f  }));
+
+TEST_P(convolution_gpu_onednn_fp32_out, fused_output_dtype) {
+    auto& engine = get_test_engine();
+    if (!engine.get_device_info().supports_immad)
+        GTEST_SKIP() << "oneDNN/XMX (immad) required for the f32 tf32 path.";
+    const auto p = GetParam();
+    const bool as_int = (p.out_dt == data_types::u8 || p.out_dt == data_types::i8);
+
+    tests::random_generator rg(GET_SUITE_NAME);
+    const int batch_num = 1, in_f = 16, out_f = 16, in_xy = 8, k = 3;
+
+    auto input_data = rg.generate_random_4d<float>(batch_num, in_f, in_xy, in_xy, -1, 1);
+    auto weights_data = rg.generate_random_4d<float>(out_f, in_f, k, k, -1, 1);
+    auto input_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(batch_num, in_f, in_xy, in_xy) });
+    auto weights_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(out_f, in_f, k, k) });
+    set_values(input_mem, flatten_4d(format::bfyx, input_data));
+    set_values(weights_mem, flatten_4d(format::bfyx, weights_data));
+
+    // Post-op data: per-channel scale for the float path, quantize ranges for the integer path.
+    auto scale_mem = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, out_f, 1, 1) });
+    set_values(scale_mem, std::vector<float>(out_f, 0.5f));
+    auto in_lo = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, 1, 1, 1) });
+    auto in_hi = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, 1, 1, 1) });
+    auto out_lo = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, 1, 1, 1) });
+    auto out_hi = engine.allocate_memory({ data_types::f32, format::bfyx, tensor(1, 1, 1, 1) });
+    set_values(in_lo, { -16.0f }); set_values(in_hi, { 16.0f });
+    set_values(out_lo, { p.out_dt == data_types::u8 ? 0.0f : -127.0f }); set_values(out_hi, { 127.0f });
+
+    auto build = [&]() {
+        topology t;
+        t.add(input_layout("input", input_mem->get_layout()));
+        t.add(data("weights", weights_mem));
+        t.add(convolution("conv", input_info("input"), "weights", no_bias, 1, { 1, 1 }, { 1, 1 }, { 0, 0 }, { 0, 0 }, false));
+        if (as_int) {
+            t.add(data("in_lo", in_lo), data("in_hi", in_hi), data("out_lo", out_lo), data("out_hi", out_hi));
+            t.add(quantize("cvt", input_info("conv"), input_info("in_lo"), input_info("in_hi"),
+                           input_info("out_lo"), input_info("out_hi"), 256, p.out_dt));
+        } else {
+            t.add(data("scale", scale_mem));
+            t.add(eltwise("cvt", { input_info("conv"), input_info("scale") }, eltwise_mode::prod, p.out_dt));
+        }
+        t.add(reorder("out", input_info("cvt"), format::bfyx, data_types::f32));
+        return t;
+    };
+
+    auto run = [&](impl_types it, bool& onednn, data_types& conv_dt, std::string& name) {
+        ExecutionConfig config = get_test_default_config(engine);
+        config.set_property(ov::intel_gpu::optimize_data(true));
+        // impl_types::any leaves the impl unforced (auto-selection).
+        if (it != impl_types::any)
+            config.set_property(ov::intel_gpu::force_implementations(
+                ov::intel_gpu::ImplForcingMap{ { "conv", { format::any, "", it } } }));
+        network network(engine, build(), config);
+        network.set_input_data("input", input_mem);
+        auto outputs = network.execute();
+        onednn = false;
+        conv_dt = data_types::f32;
+        name = "<conv not queryable (fused/renamed on the generic path)>";
+        try {  // on the generic path the conv node can be fused or renamed away
+            auto* impl = network.get_primitive("conv")->get_impl();
+            onednn = impl && impl->is_onednn();
+            conv_dt = network.get_primitive("conv")->get_output_layout().data_type;
+            name = network.get_implementation_info("conv");
+        } catch (const std::exception&) {}
+        return get_output_values_to_float<float>(network, outputs.at("out"));
+    };
+
+    bool onednn_used = false;
+    data_types onednn_dt = data_types::f32;
+    std::string sel_name;
+    std::vector<float> out;
+
+    try {
+        out = run(impl_types::any, onednn_used, onednn_dt, sel_name);
+    } catch (const std::exception& e) {
+        FAIL() << "f32 conv with fused non-f32 output was not selected onto oneDNN and its generic "
+                  "(OpenCL) path failed to build: " << e.what();
+    }
+    ASSERT_TRUE(onednn_used)
+        << "f32 conv (fused out_dt) was not selected onto oneDNN; running generic impl: " << sel_name;
+    ASSERT_EQ(onednn_dt, p.out_dt);     // fused post-op dtype became the conv output dtype
+
+    // Reference: an OCL network for the quantize path, a host-side scale for the float path.
+    std::vector<float> ref;
+    if (as_int) {
+        bool r_onednn = false;
+        data_types r_dt = data_types::f32;
+        std::string r_name;
+        ref = run(impl_types::ocl, r_onednn, r_dt, r_name);
+    } else {
+        const int out_xy = in_xy - k + 1;
+        auto rc = VVVVF<float>(batch_num, VVVF<float>(out_f));
+        for (int of = 0; of < out_f; ++of)
+            rc[0][of] = reference_convolve<float>(input_data[0], weights_data[of], 1, 1, 0);
+        for (int of = 0; of < out_f; ++of)
+            for (int y = 0; y < out_xy; ++y)
+                for (int x = 0; x < out_xy; ++x)
+                    ref.push_back(rc[0][of][y][x] * 0.5f);   // fused eltwise scale
+    }
+
+    ASSERT_EQ(out.size(), ref.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        float tol = as_int ? p.tol : p.tol * std::max(1.0f, std::abs(ref[i]));
+        ASSERT_NEAR(ref[i], out[i], tol) << " i=" << i;
+    }
+}
+
 #endif   // ENABLE_ONEDNN_FOR_GPU
 
 template <typename T>
