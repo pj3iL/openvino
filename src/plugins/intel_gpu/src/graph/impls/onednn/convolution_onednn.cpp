@@ -5,6 +5,7 @@
 #include "convolution_onednn.hpp"
 #include "convolution_inst.h"
 #include "permute_inst.h"
+#include "intel_gpu/op/convolution.hpp"
 #include "intel_gpu/runtime/format.hpp"
 #include "intel_gpu/runtime/layout.hpp"
 #include "intel_gpu/runtime/utils.hpp"
@@ -19,6 +20,13 @@
 
 #include <algorithm>
 #include <memory>
+
+namespace {
+// Use convolution::Args for
+// INPUT=0, WEIGHTS=1, BIAS=2, AZP=3, WZP=4, COMPENSATION=5
+using ConvArgs = ov::intel_gpu::op::Convolution::Args;
+}  // namespace
+
 namespace cldnn {
 namespace onednn {
 
@@ -220,6 +228,10 @@ protected:
                                                                             dnnl::memory::data_type& wzp_data_type) {
         auto attrs = impl_params.attrs_onednn;
 
+        if (impl_params.get_input_layout(ConvArgs::INPUT).data_type == data_types::f32) {
+            attrs->set_fpmath_mode(dnnl::fpmath_mode::tf32, true);
+        }
+
         // accumulation_mode::any allows oneDNN to use f16 as the accumulation type.
         if (impl_params.get_input_layout(0).data_type == data_types::f16) {
             attrs->set_accumulation_mode(dnnl::accumulation_mode::any);
@@ -412,7 +424,11 @@ in_out_fmts_t ConvolutionImplementationManager::query_formats(const program_node
 
     const auto& conv_node = node.as<convolution>();
 
-    auto prim_desc = get_convolution_primitive_descriptor(*node.get_kernel_impl_params(), dnnl::primitive_attr(), dnnl::memory::format_tag::any);
+    auto attr = dnnl::primitive_attr();
+    if (conv_node.get_input_layout(ConvArgs::INPUT).data_type == data_types::f32)
+        attr.set_fpmath_mode(dnnl::fpmath_mode::tf32, true);
+
+    auto prim_desc = get_convolution_primitive_descriptor(*node.get_kernel_impl_params(), attr, dnnl::memory::format_tag::any);
 
     for (size_t idx = 0 ; idx < node.get_dependencies().size() ; idx++) {
         if (node.get_dependency(idx).is_constant())
