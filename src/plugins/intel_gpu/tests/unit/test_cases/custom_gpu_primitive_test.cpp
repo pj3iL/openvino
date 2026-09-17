@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include "graph/include/primitive_inst.h"
 #include "test_utils.h"
 
 #include <intel_gpu/primitives/input_layout.hpp>
@@ -578,4 +579,119 @@ TEST(custom_gpu_primitive_u8, add_basic_in2x2x2x2) {
 
 TEST(export_import_custom_gpu_primitive_u8, add_basic_in2x2x2x2) {
     test_custom_gpu_primitive_u8_add_basic_in2x2x2x2<unsigned char>(true);
+}
+
+namespace {
+
+const char* const passthrough_add_kernel =
+    R"__krnl(
+        __kernel void add_kernel(const __global float* input0, __global float* output)
+        {
+            const unsigned idx = get_global_id(0);
+            output[idx] = input0[idx] + 1.0f;
+        }
+    )__krnl";
+
+std::vector<custom_gpu_primitive::arg_desc> single_in_single_out_args() {
+    return { { custom_gpu_primitive::arg_input, 0 }, { custom_gpu_primitive::arg_output, 0 } };
+}
+
+// These assertions compare against usm_host, which only differs from device memory on a dGPU.
+bool skip_unless_discrete_usm_gpu(const engine& eng) {
+    return !eng.get_device_info().supports_usm ||
+           eng.get_device_info().dev_type != device_type::discrete_gpu;
+}
+
+}  // namespace
+
+// A custom_gpu_primitive runs an OpenCL kernel on the GPU, so it must not be classified
+// as a CPU impl. Misclassification demotes the *producer's* output to host memory, making
+// every access from the GPU cross PCIe.
+TEST(custom_gpu_primitive_memory, gpu_producer_output_is_not_lockable) {
+    auto& engine = get_test_engine();
+    if (skip_unless_discrete_usm_gpu(engine)) {
+        GTEST_SKIP() << "Only meaningful on a USM-capable dGPU where lockable != device USM";
+    }
+
+    const layout io_layout = { data_types::f32, format::yxfb, { 2, 2, 2, 2 } };
+    auto input = engine.allocate_memory(io_layout);
+    set_values(input, std::vector<float>(io_layout.count(), 1.0f));
+
+    topology topology;
+    topology.add(input_layout("input", io_layout));
+    // GPU eltwise whose only user is the custom op.
+    topology.add(eltwise("producer", { input_info("input"), input_info("input") }, eltwise_mode::sum));
+    topology.add(custom_gpu_primitive("user_kernel",
+                                      { input_info("producer") },
+                                      { passthrough_add_kernel },
+                                      "add_kernel",
+                                      single_in_single_out_args(),
+                                      "-cl-mad-enable",
+                                      { io_layout },
+                                      { io_layout.count() }));
+
+    cldnn::network::ptr net = get_network(engine, topology, get_test_default_config(engine),
+                                          get_test_stream_ptr(), false);
+    net->set_input_data("input", input);
+    net->execute();
+
+    auto custom_inst = net->get_primitive("user_kernel");
+    ASSERT_NE(custom_inst->get_impl(), nullptr);
+    EXPECT_FALSE(custom_inst->get_impl()->is_cpu())
+        << "custom_gpu_primitive_impl dispatches an OpenCL kernel on the GPU, so it must not "
+           "report itself as a CPU impl.";
+    EXPECT_FALSE(custom_inst->get_impl()->requires_lockable_input())
+        << "A custom GPU kernel reads its inputs on the device and does not need them to be "
+           "host-visible.";
+
+    auto producer_inst = net->get_primitive("producer");
+    ASSERT_NE(producer_inst->output_memory_ptr(), nullptr);
+    EXPECT_NE(producer_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_host)
+        << "Producer output was demoted to usm_host because its only user is a custom op. "
+           "Both sides of this edge execute on the GPU, so the tensor should stay in device memory.";
+}
+
+// Back-to-back custom ops: the tensor between them is never touched by the host,
+// so it must stay in device memory.
+TEST(custom_gpu_primitive_memory, chained_custom_ops_stay_in_device_memory) {
+    auto& engine = get_test_engine();
+    if (skip_unless_discrete_usm_gpu(engine)) {
+        GTEST_SKIP() << "Only meaningful on a USM-capable dGPU where lockable != device USM";
+    }
+
+    const layout io_layout = { data_types::f32, format::yxfb, { 2, 2, 2, 2 } };
+    auto input = engine.allocate_memory(io_layout);
+    set_values(input, std::vector<float>(io_layout.count(), 1.0f));
+
+    topology topology;
+    topology.add(input_layout("input", io_layout));
+    topology.add(custom_gpu_primitive("user_kernel1",
+                                      { input_info("input") },
+                                      { passthrough_add_kernel },
+                                      "add_kernel",
+                                      single_in_single_out_args(),
+                                      "-cl-mad-enable",
+                                      { io_layout },
+                                      { io_layout.count() }));
+    topology.add(custom_gpu_primitive("user_kernel2",
+                                      { input_info("user_kernel1") },
+                                      { passthrough_add_kernel },
+                                      "add_kernel",
+                                      single_in_single_out_args(),
+                                      "-cl-mad-enable",
+                                      { io_layout },
+                                      { io_layout.count() }));
+
+    cldnn::network::ptr net = get_network(engine, topology, get_test_default_config(engine),
+                                          get_test_stream_ptr(), false);
+    net->set_input_data("input", input);
+    net->execute();
+
+    // Only the intermediate tensor is checked; the final output is a network output and may
+    // legitimately be host-visible for zero-copy readback.
+    auto first_inst = net->get_primitive("user_kernel1");
+    ASSERT_NE(first_inst->output_memory_ptr(), nullptr);
+    EXPECT_EQ(first_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device)
+        << "The tensor between two GPU custom ops is never read by the host and should be "
+           "allocated in device memory.";
 }
