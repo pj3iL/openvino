@@ -104,6 +104,9 @@ struct custom_gpu_primitive_impl : typed_primitive_impl<custom_gpu_primitive> {
     , cl_kernel(cl_kernel)
     , size_expr_map(size_expr_map) { }
 
+    // Dispatches a user-supplied OpenCL kernel on the device, like any other ocl impl.
+    bool is_cpu() const override { return false; }
+
     std::vector<std::shared_ptr<cldnn::kernel_string>> get_kernels_source() override {
         std::vector<std::shared_ptr<cldnn::kernel_string>> kernel_strings;
         kernel_strings.push_back(cl_kernel->code.kernelString);

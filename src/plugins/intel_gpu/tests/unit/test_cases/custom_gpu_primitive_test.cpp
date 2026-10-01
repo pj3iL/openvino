@@ -5,6 +5,7 @@
 #include "graph/include/primitive_inst.h"
 #include "test_utils.h"
 
+#include <intel_gpu/primitives/activation.hpp>
 #include <intel_gpu/primitives/input_layout.hpp>
 #include <intel_gpu/primitives/eltwise.hpp>
 #include <intel_gpu/primitives/reorder.hpp>
@@ -602,6 +603,14 @@ bool skip_unless_discrete_usm_gpu(const engine& eng) {
            eng.get_device_info().dev_type != device_type::discrete_gpu;
 }
 
+// CPU activation reads and writes tensor data on the host, so it genuinely requires lockable input.
+ExecutionConfig config_forcing_cpu_impl(engine& eng, const primitive_id& id) {
+    ExecutionConfig config = get_test_default_config(eng);
+    ov::intel_gpu::ImplementationDesc cpu_impl = { format::bfyx, "", impl_types::cpu };
+    config.set_property(ov::intel_gpu::force_implementations(ov::intel_gpu::ImplForcingMap{ { id, cpu_impl } }));
+    return config;
+}
+
 }  // namespace
 
 // A custom_gpu_primitive runs an OpenCL kernel on the GPU, so it must not be classified
@@ -694,4 +703,89 @@ TEST(custom_gpu_primitive_memory, chained_custom_ops_stay_in_device_memory) {
     EXPECT_EQ(first_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_device)
         << "The tensor between two GPU custom ops is never read by the host and should be "
            "allocated in device memory.";
+}
+
+// Negative control: a producer feeding both a custom op and a real CPU impl has a single
+// output buffer, so the host-reading user still decides. Guards against widening the custom
+// op opt-out into "no user ever forces lockable".
+TEST(custom_gpu_primitive_memory, cpu_user_alongside_custom_op_still_forces_lockable) {
+    auto& engine = get_test_engine();
+    if (skip_unless_discrete_usm_gpu(engine)) {
+        GTEST_SKIP() << "Only meaningful on a USM-capable dGPU where lockable != device USM";
+    }
+
+    const layout io_layout{ ov::PartialShape{ 1, 4 }, data_types::f32, format::bfyx };
+    auto input = engine.allocate_memory(io_layout);
+    set_values<float>(input, { 1.0f, 2.0f, 3.0f, 4.0f });
+
+    topology topology;
+    topology.add(input_layout("input", io_layout));
+    topology.add(eltwise("producer", { input_info("input"), input_info("input") }, eltwise_mode::sum));
+    topology.add(custom_gpu_primitive("user_kernel",
+                                      { input_info("producer") },
+                                      { passthrough_add_kernel },
+                                      "add_kernel",
+                                      single_in_single_out_args(),
+                                      "-cl-mad-enable",
+                                      { io_layout },
+                                      { io_layout.count() }));
+    topology.add(activation("cpu_consumer", input_info("producer"), activation_func::relu));
+
+    cldnn::network::ptr net = get_network(engine, topology, config_forcing_cpu_impl(engine, "cpu_consumer"),
+                                          get_test_stream_ptr(), false);
+    net->set_input_data("input", input);
+    net->execute();
+
+    auto cpu_consumer_inst = net->get_primitive("cpu_consumer");
+    ASSERT_NE(cpu_consumer_inst->get_impl(), nullptr);
+    ASSERT_TRUE(cpu_consumer_inst->get_impl()->requires_lockable_input())
+        << "Test setup is invalid unless the consumer really was forced onto a CPU impl.";
+
+    auto producer_inst = net->get_primitive("producer");
+    ASSERT_NE(producer_inst->output_memory_ptr(), nullptr);
+    EXPECT_EQ(producer_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_host)
+        << "One user reads this tensor on the host, so the producer's single output buffer must "
+           "stay lockable even though its other user is a GPU custom op.";
+}
+
+// The custom op no longer forces its own producer into host memory, but it must still hand
+// host-visible memory to a downstream CPU impl that reads its result.
+TEST(custom_gpu_primitive_memory, custom_op_output_is_lockable_for_cpu_consumer) {
+    auto& engine = get_test_engine();
+    if (skip_unless_discrete_usm_gpu(engine)) {
+        GTEST_SKIP() << "Only meaningful on a USM-capable dGPU where lockable != device USM";
+    }
+
+    const layout io_layout{ ov::PartialShape{ 1, 4 }, data_types::f32, format::bfyx };
+    auto input = engine.allocate_memory(io_layout);
+    set_values<float>(input, { 1.0f, 2.0f, 3.0f, 4.0f });
+
+    topology topology;
+    topology.add(input_layout("input", io_layout));
+    topology.add(custom_gpu_primitive("user_kernel",
+                                      { input_info("input") },
+                                      { passthrough_add_kernel },
+                                      "add_kernel",
+                                      single_in_single_out_args(),
+                                      "-cl-mad-enable",
+                                      { io_layout },
+                                      { io_layout.count() }));
+    // Keeps the custom op intermediate, so its allocation is not decided by the network-output path.
+    topology.add(activation("cpu_consumer", input_info("user_kernel"), activation_func::relu));
+
+    cldnn::network::ptr net = get_network(engine, topology, config_forcing_cpu_impl(engine, "cpu_consumer"),
+                                          get_test_stream_ptr(), false);
+    net->set_input_data("input", input);
+    net->execute();
+
+    auto cpu_consumer_inst = net->get_primitive("cpu_consumer");
+    ASSERT_NE(cpu_consumer_inst->get_impl(), nullptr);
+    ASSERT_TRUE(cpu_consumer_inst->get_impl()->requires_lockable_input())
+        << "Test setup is invalid unless the consumer really was forced onto a CPU impl.";
+
+    auto custom_inst = net->get_primitive("user_kernel");
+    ASSERT_NE(custom_inst->output_memory_ptr(), nullptr);
+    EXPECT_EQ(custom_inst->output_memory_ptr()->get_allocation_type(), allocation_type::usm_host)
+        << "The custom op's result is read on the host by its CPU user, so its output must be "
+           "allocated in lockable memory.";
 }
